@@ -2,7 +2,7 @@
 
 > Formerly **CityPulse**.
 
-A Python ETL pipeline that collects **weather**, **air quality** and **traffic** snapshots for Ukrainian cities from public APIs, validates the responses and stores them in PostgreSQL. The database schema is versioned with Alembic and the whole environment runs in Docker.
+A Python ETL pipeline that collects **weather**, **air quality** and **traffic** data for Ukrainian cities from public APIs, validates the responses and stores them in PostgreSQL. The database schema is versioned with Alembic and the whole environment runs in Docker. Hourly history can be loaded with a backfill script, and live snapshots are collected on a schedule.
 
 Currently configured for **Kyiv** and **Lviv**; the list of cities is a single config file (`src/config.py`).
 
@@ -14,7 +14,9 @@ flowchart LR
     W[Open-Meteo Weather] --> R
     A[Open-Meteo Air Quality] --> R
     T[TomTom Traffic Flow] --> R
-    R[Ingestion runner<br/>fetch + Pydantic validation + logging] --> P[(PostgreSQL<br/>Docker)]
+    R[Ingestion runner<br/>fetch + Pydantic validation + logging] --> P[(PostgreSQL<br/>Docker volume)]
+    B[Backfill script<br/>hourly history] --> P
+    S[Task Scheduler<br/>every 30 min] -. triggers .-> R
     M[Alembic migrations] -. schema .-> P
 ```
 
@@ -23,9 +25,12 @@ Each source (`weather`, `air_quality`, `traffic`) is a separate module with its 
 **Design decisions**
 - **Validation at the boundary.** Every API response is parsed with a Pydantic model before it touches the database.
 - **A failure for one city does not stop the run.** The error is logged, the transaction is rolled back and the runner moves on to the next city.
+- **Secrets stay out of logs.** Error messages are trimmed so that request URLs (which contain the API key) are never written to the log files.
 - **Geocoding is disambiguated** by country and region (e.g. `Lviv Oblast`), so a city name is never matched to the wrong place.
 - **The city dimension is upserted** with a single `INSERT ... ON CONFLICT DO UPDATE ... RETURNING id`.
 - **Logs are written per source** (`logs/weather.log`, `logs/air_quality.log`, `logs/traffic.log`).
+- **Data survives container recreation.** PostgreSQL stores its data in a named Docker volume.
+- **The backfill is re-runnable.** It skips rows that already exist for a city and timestamp.
 
 ## Data sources
 
@@ -38,6 +43,8 @@ Each source (`weather`, `air_quality`, `traffic`) is a separate module with its 
 
 Traffic data describes the road segment closest to the city coordinates, not the whole city.
 
+All timestamps are stored in **UTC**.
+
 ## Data model
 
 ```
@@ -48,7 +55,7 @@ cities (id, city_name, latitude, longitude, country, region)
                       current_travel_time, free_flow_travel_time, road_closure)
 ```
 
-Foreign keys on `city_id` are indexed. Each run appends one snapshot per city per source.
+Foreign keys on `city_id` are indexed. Each scheduled run appends one snapshot per city per source; the backfill adds hourly rows.
 
 ## Tech stack
 
@@ -65,10 +72,11 @@ Python · PostgreSQL 16 · Docker / Docker Compose · Alembic · psycopg2 · Pyd
 │   ├── db.py                # DB connection, city upsert
 │   ├── geocoding.py         # city name → coordinates
 │   ├── ingestion_runner.py  # shared fetch → validate → insert flow
+│   ├── backfill.py          # one-off load of hourly weather and air quality history
 │   ├── weather/ingestion.py
 │   ├── air_quality/ingestion.py
 │   └── traffic/ingestion.py
-├── docker-compose.yml       # PostgreSQL service
+├── docker-compose.yml       # PostgreSQL service with a persistent volume
 ├── alembic.ini
 ├── requirements.txt
 └── .dist.env                # template for environment variables
@@ -76,7 +84,7 @@ Python · PostgreSQL 16 · Docker / Docker Compose · Alembic · psycopg2 · Pyd
 
 ## Getting started
 
-**Prerequisites:** Python 3.10+, Git, Docker Desktop (running), a free [TomTom developer API key](https://developer.tomtom.com/). The Open-Meteo APIs need no key.
+**Prerequisites:** Python 3.10+, Git, Docker Desktop (running), a free [TomTom developer API key](https://developer.tomtom.com/) for the traffic module. The Open-Meteo APIs need no key.
 
 **1. Clone and install**
 
@@ -103,17 +111,29 @@ Fill in `.env`:
 |---|---|
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Database credentials of your choice |
 | `POSTGRES_HOST` | `localhost` |
-| `POSTGRES_PORT` | `5433` (the port mapped in `docker-compose.yml`) |
+| `POSTGRES_PORT` | `5434` (the host port mapped in `docker-compose.yml`) |
 | `TOMTOM_API_KEY` | Your TomTom API key |
+
+The `.env` file is ignored by git and must never be committed.
 
 **3. Start PostgreSQL and create the schema**
 
 ```bash
-docker-compose up -d
+docker compose up -d
 alembic upgrade head
 ```
 
-**4. Run the pipeline**
+Data is kept in the `citypulse_data` Docker volume, so it survives `docker compose down`. Use `docker compose down -v` only if you want to delete it.
+
+**4. Load historical data (optional)**
+
+```bash
+python -m src.backfill --days 60
+```
+
+Loads hourly weather and air quality history for the configured cities from Open-Meteo (up to 92 days). The values come from the Open-Meteo forecast and air quality models, not from weather station measurements. Rows with missing values are skipped, and the script can safely be run more than once.
+
+**5. Run the pipeline**
 
 Each source is run as a module, from the project root:
 
@@ -132,7 +152,27 @@ Example log output (`logs/weather.log`):
 2026-09-06 20:23:26 - INFO - Connection with bd closed!
 ```
 
-**5. Check the data**
+**6. Collect data on a schedule (Windows)**
+
+Create `run_all.bat` in the project root. It uses `%~dp0`, so it works from any location:
+
+```bat
+@echo off
+cd /d "%~dp0"
+call venv\Scripts\activate.bat
+python -m src.weather.ingestion
+python -m src.air_quality.ingestion
+```
+
+Register it in Task Scheduler to run every 30 minutes:
+
+```powershell
+schtasks /create /tn "UrbanDataPipeline" /tr "C:\full\path\to\run_all.bat" /sc minute /mo 30
+```
+
+The computer must be on and Docker Desktop running while the task executes.
+
+**7. Check the data**
 
 ```sql
 SELECT c.city_name, w.recorded_at, w.temperature, w.wind_speed
@@ -140,6 +180,17 @@ FROM weather_data w
 JOIN cities c ON c.id = w.city_id
 ORDER BY w.recorded_at DESC
 LIMIT 5;
+```
+
+Air quality by city, daily average:
+
+```sql
+SELECT c.city_name, a.recorded_at::date AS day, ROUND(AVG(a.pm2_5)::numeric, 1) AS avg_pm2_5
+FROM air_quality a
+JOIN cities c ON c.id = a.city_id
+GROUP BY c.city_name, day
+ORDER BY day DESC, c.city_name
+LIMIT 10;
 ```
 
 Traffic congestion (1.0 means free-flowing, lower means slower than normal):
@@ -152,6 +203,12 @@ JOIN cities c ON c.id = t.city_id
 ORDER BY t.recorded_at DESC
 LIMIT 5;
 ```
+
+## Known limitations
+
+- **Traffic is currently not collected.** The traffic module is implemented, but the TomTom Flow Segment API returns `400 Point too far from nearest existing segment` for the configured Ukrainian cities, while the same request works for a test point in Warsaw. It was working earlier, so the cause is on the API side. The module is therefore left out of the scheduled run, and `traffic_data` only contains data from earlier manual runs.
+- **Duplicates are possible in live collection.** The tables have no unique constraint on `(city_id, recorded_at)` yet (see the roadmap). Only the backfill checks for existing rows.
+- **Historical values are model data**, not station measurements, and are stored in UTC.
 
 ## Database migrations
 
@@ -172,11 +229,15 @@ ruff check src/
 ruff check --fix src/
 ```
 
-Development follows a feature-branch + pull request workflow with Conventional Commits.
+Work is done on the `develop` branch with Conventional Commits; stable versions are merged into `main` through pull requests.
 
 ## Roadmap
 
+- [x] Historical backfill of weather and air quality
+- [x] Persistent database volume and scheduled collection
+- [ ] Power BI dashboard on top of the PostgreSQL data (Power Query, star-schema model, DAX measures)
 - [ ] Idempotent inserts: unique constraint on `(city_id, recorded_at)` + `ON CONFLICT DO NOTHING`
+- [ ] Restore traffic collection (alternative API or different coordinates)
 - [ ] Unit tests (`pytest`) for validation and parsing, and CI with GitHub Actions
 - [ ] Scheduled runs with Apache Airflow
 - [ ] Analytical models and data quality tests with dbt
